@@ -15,6 +15,9 @@ app.get("/health", (req, res) => {
   res.json({ status: "ok", service: "ImpactGrid Dijo", ts: new Date().toISOString() });
 });
 
+/* ── Keep-warm ping ── */
+app.get("/ping", (req, res) => res.json({ pong: true }));
+
 /* ── Chat endpoint ── */
 app.post("/chat", async (req, res) => {
   try {
@@ -63,8 +66,48 @@ Be specific, direct, and data-driven. No generic advice.`
   }
 });
 
-/* ── Keep-warm ping ── */
-app.get("/ping", (req, res) => res.json({ pong: true }));
+
+/* ================================================================
+   META WEBHOOK
+   Add to Render environment variables:
+     META_WEBHOOK_VERIFY_TOKEN = impactgrid_webhook_2026
+
+   In Meta Developer Portal → Webhooks:
+     Callback URL:  https://impactgrid-dijo.onrender.com/webhook
+     Verify token:  impactgrid_webhook_2026
+================================================================ */
+
+app.get("/webhook", (req, res) => {
+  const VERIFY_TOKEN = process.env.META_WEBHOOK_VERIFY_TOKEN;
+  const mode         = req.query["hub.mode"];
+  const token        = req.query["hub.verify_token"];
+  const challenge    = req.query["hub.challenge"];
+
+  if (mode === "subscribe" && token === VERIFY_TOKEN) {
+    console.log("[Meta Webhook] Verified successfully");
+    res.status(200).send(challenge);
+  } else {
+    console.warn("[Meta Webhook] Verification failed — token mismatch");
+    res.status(403).json({ error: "Verification failed" });
+  }
+});
+
+app.post("/webhook", (req, res) => {
+  const body = req.body;
+  console.log("[Meta Webhook] Event received:", JSON.stringify(body));
+  if (body.object === "instagram") {
+    body.entry?.forEach((entry) => {
+      entry.changes?.forEach((change) => {
+        console.log("[Meta Webhook] Instagram change:", change.field, change.value);
+      });
+    });
+  }
+  res.status(200).send("EVENT_RECEIVED");
+});
+
+/* ================================================================
+   END META WEBHOOK
+================================================================ */
 
 
 /* ================================================================
@@ -75,13 +118,9 @@ app.get("/ping", (req, res) => res.json({ pong: true }));
      TIKTOK_REDIRECT_URI  (https://impactgridgroup.com/tiktok-callback.html)
 ================================================================ */
 
-/* ── ROUTE 1: Token Exchange ── */
 app.post("/tiktok/token", async (req, res) => {
   const { code, redirect_uri, code_verifier } = req.body;
-
-  if (!code || !code_verifier) {
-    return res.status(400).json({ error: "Missing code or code_verifier" });
-  }
+  if (!code || !code_verifier) return res.status(400).json({ error: "Missing code or code_verifier" });
 
   try {
     const response = await fetch("https://open.tiktokapis.com/v2/oauth/token/", {
@@ -90,15 +129,14 @@ app.post("/tiktok/token", async (req, res) => {
       body: new URLSearchParams({
         client_key:    process.env.TIKTOK_CLIENT_KEY,
         client_secret: process.env.TIKTOK_CLIENT_SECRET,
-        code:          code,
+        code,
         grant_type:    "authorization_code",
         redirect_uri:  redirect_uri || process.env.TIKTOK_REDIRECT_URI,
-        code_verifier: code_verifier
+        code_verifier
       }).toString()
     });
 
     const data = await response.json();
-
     if (!response.ok || data.error) {
       console.error("[TikTok /token] Error:", data);
       return res.status(400).json({ error: data.error || "Token exchange failed", details: data });
@@ -118,8 +156,6 @@ app.post("/tiktok/token", async (req, res) => {
   }
 });
 
-
-/* ── ROUTE 2: User Profile (Display API) ── */
 app.post("/tiktok/profile", async (req, res) => {
   const { access_token } = req.body;
   if (!access_token) return res.status(400).json({ error: "Missing access_token" });
@@ -127,14 +163,10 @@ app.post("/tiktok/profile", async (req, res) => {
   try {
     const response = await fetch(
       "https://open.tiktokapis.com/v2/user/info/?fields=open_id,union_id,avatar_url,display_name,username,follower_count,following_count,likes_count,video_count",
-      {
-        method: "GET",
-        headers: { "Authorization": "Bearer " + access_token }
-      }
+      { method: "GET", headers: { "Authorization": "Bearer " + access_token } }
     );
 
     const data = await response.json();
-
     if (!response.ok || data.error) {
       console.error("[TikTok /profile] Error:", data);
       return res.status(400).json({ error: "Failed to fetch profile", details: data });
@@ -148,8 +180,6 @@ app.post("/tiktok/profile", async (req, res) => {
   }
 });
 
-
-/* ── ROUTE 3: User Videos (Display API) ── */
 app.post("/tiktok/videos", async (req, res) => {
   const { access_token, max_count } = req.body;
   if (!access_token) return res.status(400).json({ error: "Missing access_token" });
@@ -159,16 +189,12 @@ app.post("/tiktok/videos", async (req, res) => {
       "https://open.tiktokapis.com/v2/video/list/?fields=id,title,cover_image_url,video_description,duration,like_count,comment_count,share_count,view_count",
       {
         method: "POST",
-        headers: {
-          "Authorization": "Bearer " + access_token,
-          "Content-Type":  "application/json"
-        },
+        headers: { "Authorization": "Bearer " + access_token, "Content-Type": "application/json" },
         body: JSON.stringify({ max_count: max_count || 10 })
       }
     );
 
     const data = await response.json();
-
     if (!response.ok || data.error) {
       console.error("[TikTok /videos] Error:", data);
       return res.status(400).json({ error: "Failed to fetch videos", details: data });
@@ -182,22 +208,14 @@ app.post("/tiktok/videos", async (req, res) => {
   }
 });
 
-
-/* ── ROUTE 4: Publish Video (Content Posting API) ── */
 app.post("/tiktok/publish", async (req, res) => {
   const { access_token, video_url, caption, privacy_level } = req.body;
-
-  if (!access_token || !video_url) {
-    return res.status(400).json({ error: "Missing access_token or video_url" });
-  }
+  if (!access_token || !video_url) return res.status(400).json({ error: "Missing access_token or video_url" });
 
   try {
     const response = await fetch("https://open.tiktokapis.com/v2/post/publish/video/init/", {
       method: "POST",
-      headers: {
-        "Authorization": "Bearer " + access_token,
-        "Content-Type":  "application/json"
-      },
+      headers: { "Authorization": "Bearer " + access_token, "Content-Type": "application/json" },
       body: JSON.stringify({
         post_info: {
           title:           caption || "",
@@ -206,24 +224,17 @@ app.post("/tiktok/publish", async (req, res) => {
           disable_comment: false,
           disable_stitch:  false
         },
-        source_info: {
-          source:    "PULL_FROM_URL",
-          video_url: video_url
-        }
+        source_info: { source: "PULL_FROM_URL", video_url }
       })
     });
 
     const data = await response.json();
-
     if (!response.ok || (data.error && data.error.code !== "ok")) {
       console.error("[TikTok /publish] Error:", data);
       return res.status(400).json({ error: "Publish failed", details: data });
     }
 
-    res.json({
-      publish_id: data.data?.publish_id,
-      status:     "publishing"
-    });
+    res.json({ publish_id: data.data?.publish_id, status: "publishing" });
 
   } catch (err) {
     console.error("[TikTok /publish] Exception:", err.message);
@@ -231,32 +242,19 @@ app.post("/tiktok/publish", async (req, res) => {
   }
 });
 
-
-/* ── ROUTE 5: Share Kit ── */
 app.post("/tiktok/share", async (req, res) => {
   const { access_token, video_url, title } = req.body;
-
-  if (!access_token || !video_url) {
-    return res.status(400).json({ error: "Missing access_token or video_url" });
-  }
+  if (!access_token || !video_url) return res.status(400).json({ error: "Missing access_token or video_url" });
 
   try {
-    /* Verify token is still valid */
     const verify = await fetch(
       "https://open.tiktokapis.com/v2/user/info/?fields=open_id",
       { headers: { "Authorization": "Bearer " + access_token } }
     );
 
-    if (!verify.ok) {
-      return res.status(401).json({ error: "Invalid or expired access token" });
-    }
+    if (!verify.ok) return res.status(401).json({ error: "Invalid or expired access token" });
 
-    res.json({
-      share_url:  video_url,
-      title:      title || "",
-      client_key: process.env.TIKTOK_CLIENT_KEY,
-      status:     "ready"
-    });
+    res.json({ share_url: video_url, title: title || "", client_key: process.env.TIKTOK_CLIENT_KEY, status: "ready" });
 
   } catch (err) {
     console.error("[TikTok /share] Exception:", err.message);
@@ -264,8 +262,6 @@ app.post("/tiktok/share", async (req, res) => {
   }
 });
 
-
-/* ── ROUTE 6: Refresh Token ── */
 app.post("/tiktok/refresh", async (req, res) => {
   const { refresh_token } = req.body;
   if (!refresh_token) return res.status(400).json({ error: "Missing refresh_token" });
@@ -278,21 +274,14 @@ app.post("/tiktok/refresh", async (req, res) => {
         client_key:    process.env.TIKTOK_CLIENT_KEY,
         client_secret: process.env.TIKTOK_CLIENT_SECRET,
         grant_type:    "refresh_token",
-        refresh_token: refresh_token
+        refresh_token
       }).toString()
     });
 
     const data = await response.json();
+    if (!response.ok || data.error) return res.status(400).json({ error: "Token refresh failed", details: data });
 
-    if (!response.ok || data.error) {
-      return res.status(400).json({ error: "Token refresh failed", details: data });
-    }
-
-    res.json({
-      access_token:  data.access_token,
-      expires_in:    data.expires_in,
-      refresh_token: data.refresh_token
-    });
+    res.json({ access_token: data.access_token, expires_in: data.expires_in, refresh_token: data.refresh_token });
 
   } catch (err) {
     console.error("[TikTok /refresh] Exception:", err.message);
@@ -313,13 +302,11 @@ app.post("/tiktok/refresh", async (req, res) => {
      INSTAGRAM_REDIRECT_URI  (https://impactgridgroup.com/instagram-callback.html)
 ================================================================ */
 
-/* ── ROUTE 1: Token Exchange ── */
 app.post("/instagram/token", async (req, res) => {
   const { code, redirect_uri } = req.body;
   if (!code) return res.status(400).json({ error: "Missing code" });
 
   try {
-    /* Step 1: Short-lived token */
     const shortRes = await fetch("https://api.instagram.com/oauth/access_token", {
       method: "POST",
       headers: { "Content-Type": "application/x-www-form-urlencoded" },
@@ -328,7 +315,7 @@ app.post("/instagram/token", async (req, res) => {
         client_secret: process.env.INSTAGRAM_APP_SECRET,
         grant_type:    "authorization_code",
         redirect_uri:  redirect_uri || process.env.INSTAGRAM_REDIRECT_URI,
-        code:          code
+        code
       }).toString()
     });
 
@@ -338,26 +325,16 @@ app.post("/instagram/token", async (req, res) => {
       return res.status(400).json({ error: "Token exchange failed", details: shortData });
     }
 
-    /* Step 2: Exchange for long-lived token (60 days) */
-    const longRes = await fetch(
+    const longRes  = await fetch(
       `https://graph.instagram.com/access_token?grant_type=ig_exchange_token&client_secret=${process.env.INSTAGRAM_APP_SECRET}&access_token=${shortData.access_token}`
     );
-
     const longData = await longRes.json();
+
     if (!longRes.ok || longData.error) {
-      /* Fall back to short-lived token if long-lived exchange fails */
-      return res.json({
-        access_token: shortData.access_token,
-        user_id:      shortData.user_id,
-        expires_in:   3600
-      });
+      return res.json({ access_token: shortData.access_token, user_id: shortData.user_id, expires_in: 3600 });
     }
 
-    res.json({
-      access_token: longData.access_token,
-      user_id:      shortData.user_id,
-      expires_in:   longData.expires_in || 5184000
-    });
+    res.json({ access_token: longData.access_token, user_id: shortData.user_id, expires_in: longData.expires_in || 5184000 });
 
   } catch (err) {
     console.error("[Instagram /token] Exception:", err.message);
@@ -365,24 +342,20 @@ app.post("/instagram/token", async (req, res) => {
   }
 });
 
-
-/* ── ROUTE 2: User Profile ── */
 app.post("/instagram/profile", async (req, res) => {
   const { access_token, user_id } = req.body;
   if (!access_token) return res.status(400).json({ error: "Missing access_token" });
 
   try {
-    const uid = user_id || "me";
+    const uid      = user_id || "me";
     const response = await fetch(
       `https://graph.instagram.com/v19.0/${uid}?fields=id,username,name,biography,followers_count,follows_count,media_count,profile_picture_url,website&access_token=${access_token}`
     );
-
     const data = await response.json();
     if (!response.ok || data.error) {
       console.error("[Instagram /profile] Error:", data);
       return res.status(400).json({ error: "Failed to fetch profile", details: data });
     }
-
     res.json(data);
 
   } catch (err) {
@@ -391,24 +364,20 @@ app.post("/instagram/profile", async (req, res) => {
   }
 });
 
-
-/* ── ROUTE 3: Media List ── */
 app.post("/instagram/media", async (req, res) => {
   const { access_token, user_id } = req.body;
   if (!access_token) return res.status(400).json({ error: "Missing access_token" });
 
   try {
-    const uid = user_id || "me";
+    const uid      = user_id || "me";
     const response = await fetch(
       `https://graph.instagram.com/v19.0/${uid}/media?fields=id,caption,media_type,media_url,thumbnail_url,timestamp,like_count,comments_count,permalink&limit=12&access_token=${access_token}`
     );
-
     const data = await response.json();
     if (!response.ok || data.error) {
       console.error("[Instagram /media] Error:", data);
       return res.status(400).json({ error: "Failed to fetch media", details: data });
     }
-
     res.json(data);
 
   } catch (err) {
@@ -417,24 +386,20 @@ app.post("/instagram/media", async (req, res) => {
   }
 });
 
-
-/* ── ROUTE 4: Insights ── */
 app.post("/instagram/insights", async (req, res) => {
   const { access_token, user_id } = req.body;
   if (!access_token) return res.status(400).json({ error: "Missing access_token" });
 
   try {
-    const uid = user_id || "me";
+    const uid      = user_id || "me";
     const response = await fetch(
       `https://graph.instagram.com/v19.0/${uid}/insights?metric=reach,impressions,profile_views,follower_count&period=day&access_token=${access_token}`
     );
-
     const data = await response.json();
     if (!response.ok || data.error) {
       console.error("[Instagram /insights] Error:", data);
       return res.status(400).json({ error: "Failed to fetch insights", details: data });
     }
-
     res.json(data);
 
   } catch (err) {
@@ -443,31 +408,17 @@ app.post("/instagram/insights", async (req, res) => {
   }
 });
 
-
-/* ── ROUTE 5: Publish Content ── */
 app.post("/instagram/publish", async (req, res) => {
   const { access_token, user_id, image_url, caption } = req.body;
-
-  if (!access_token || !image_url) {
-    return res.status(400).json({ error: "Missing access_token or image_url" });
-  }
+  if (!access_token || !image_url) return res.status(400).json({ error: "Missing access_token or image_url" });
 
   try {
-    const uid = user_id || "me";
-
-    /* Step 1: Create media container */
-    const containerRes = await fetch(
-      `https://graph.instagram.com/v19.0/${uid}/media`,
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          image_url:    image_url,
-          caption:      caption || "",
-          access_token: access_token
-        })
-      }
-    );
+    const uid          = user_id || "me";
+    const containerRes = await fetch(`https://graph.instagram.com/v19.0/${uid}/media`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ image_url, caption: caption || "", access_token })
+    });
 
     const containerData = await containerRes.json();
     if (!containerRes.ok || containerData.error) {
@@ -475,20 +426,13 @@ app.post("/instagram/publish", async (req, res) => {
       return res.status(400).json({ error: "Failed to create media container", details: containerData });
     }
 
-    /* Step 2: Publish the container */
-    const publishRes = await fetch(
-      `https://graph.instagram.com/v19.0/${uid}/media_publish`,
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          creation_id:  containerData.id,
-          access_token: access_token
-        })
-      }
-    );
-
+    const publishRes  = await fetch(`https://graph.instagram.com/v19.0/${uid}/media_publish`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ creation_id: containerData.id, access_token })
+    });
     const publishData = await publishRes.json();
+
     if (!publishRes.ok || publishData.error) {
       console.error("[Instagram /publish] Publish error:", publishData);
       return res.status(400).json({ error: "Failed to publish media", details: publishData });
