@@ -305,6 +305,208 @@ app.post("/tiktok/refresh", async (req, res) => {
 ================================================================ */
 
 
+/* ================================================================
+   INSTAGRAM ROUTES
+   Requires these environment variables set on Render:
+     INSTAGRAM_APP_ID
+     INSTAGRAM_APP_SECRET
+     INSTAGRAM_REDIRECT_URI  (https://impactgridgroup.com/instagram-callback.html)
+================================================================ */
+
+/* ── ROUTE 1: Token Exchange ── */
+app.post("/instagram/token", async (req, res) => {
+  const { code, redirect_uri } = req.body;
+  if (!code) return res.status(400).json({ error: "Missing code" });
+
+  try {
+    /* Step 1: Short-lived token */
+    const shortRes = await fetch("https://api.instagram.com/oauth/access_token", {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        client_id:     process.env.INSTAGRAM_APP_ID,
+        client_secret: process.env.INSTAGRAM_APP_SECRET,
+        grant_type:    "authorization_code",
+        redirect_uri:  redirect_uri || process.env.INSTAGRAM_REDIRECT_URI,
+        code:          code
+      }).toString()
+    });
+
+    const shortData = await shortRes.json();
+    if (!shortRes.ok || shortData.error) {
+      console.error("[Instagram /token] Short token error:", shortData);
+      return res.status(400).json({ error: "Token exchange failed", details: shortData });
+    }
+
+    /* Step 2: Exchange for long-lived token (60 days) */
+    const longRes = await fetch(
+      `https://graph.instagram.com/access_token?grant_type=ig_exchange_token&client_secret=${process.env.INSTAGRAM_APP_SECRET}&access_token=${shortData.access_token}`
+    );
+
+    const longData = await longRes.json();
+    if (!longRes.ok || longData.error) {
+      /* Fall back to short-lived token if long-lived exchange fails */
+      return res.json({
+        access_token: shortData.access_token,
+        user_id:      shortData.user_id,
+        expires_in:   3600
+      });
+    }
+
+    res.json({
+      access_token: longData.access_token,
+      user_id:      shortData.user_id,
+      expires_in:   longData.expires_in || 5184000
+    });
+
+  } catch (err) {
+    console.error("[Instagram /token] Exception:", err.message);
+    res.status(500).json({ error: "Token exchange failed", details: err.message });
+  }
+});
+
+
+/* ── ROUTE 2: User Profile ── */
+app.post("/instagram/profile", async (req, res) => {
+  const { access_token, user_id } = req.body;
+  if (!access_token) return res.status(400).json({ error: "Missing access_token" });
+
+  try {
+    const uid = user_id || "me";
+    const response = await fetch(
+      `https://graph.instagram.com/v19.0/${uid}?fields=id,username,name,biography,followers_count,follows_count,media_count,profile_picture_url,website&access_token=${access_token}`
+    );
+
+    const data = await response.json();
+    if (!response.ok || data.error) {
+      console.error("[Instagram /profile] Error:", data);
+      return res.status(400).json({ error: "Failed to fetch profile", details: data });
+    }
+
+    res.json(data);
+
+  } catch (err) {
+    console.error("[Instagram /profile] Exception:", err.message);
+    res.status(500).json({ error: "Profile fetch failed", details: err.message });
+  }
+});
+
+
+/* ── ROUTE 3: Media List ── */
+app.post("/instagram/media", async (req, res) => {
+  const { access_token, user_id } = req.body;
+  if (!access_token) return res.status(400).json({ error: "Missing access_token" });
+
+  try {
+    const uid = user_id || "me";
+    const response = await fetch(
+      `https://graph.instagram.com/v19.0/${uid}/media?fields=id,caption,media_type,media_url,thumbnail_url,timestamp,like_count,comments_count,permalink&limit=12&access_token=${access_token}`
+    );
+
+    const data = await response.json();
+    if (!response.ok || data.error) {
+      console.error("[Instagram /media] Error:", data);
+      return res.status(400).json({ error: "Failed to fetch media", details: data });
+    }
+
+    res.json(data);
+
+  } catch (err) {
+    console.error("[Instagram /media] Exception:", err.message);
+    res.status(500).json({ error: "Media fetch failed", details: err.message });
+  }
+});
+
+
+/* ── ROUTE 4: Insights ── */
+app.post("/instagram/insights", async (req, res) => {
+  const { access_token, user_id } = req.body;
+  if (!access_token) return res.status(400).json({ error: "Missing access_token" });
+
+  try {
+    const uid = user_id || "me";
+    const response = await fetch(
+      `https://graph.instagram.com/v19.0/${uid}/insights?metric=reach,impressions,profile_views,follower_count&period=day&access_token=${access_token}`
+    );
+
+    const data = await response.json();
+    if (!response.ok || data.error) {
+      console.error("[Instagram /insights] Error:", data);
+      return res.status(400).json({ error: "Failed to fetch insights", details: data });
+    }
+
+    res.json(data);
+
+  } catch (err) {
+    console.error("[Instagram /insights] Exception:", err.message);
+    res.status(500).json({ error: "Insights fetch failed", details: err.message });
+  }
+});
+
+
+/* ── ROUTE 5: Publish Content ── */
+app.post("/instagram/publish", async (req, res) => {
+  const { access_token, user_id, image_url, caption } = req.body;
+
+  if (!access_token || !image_url) {
+    return res.status(400).json({ error: "Missing access_token or image_url" });
+  }
+
+  try {
+    const uid = user_id || "me";
+
+    /* Step 1: Create media container */
+    const containerRes = await fetch(
+      `https://graph.instagram.com/v19.0/${uid}/media`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          image_url:    image_url,
+          caption:      caption || "",
+          access_token: access_token
+        })
+      }
+    );
+
+    const containerData = await containerRes.json();
+    if (!containerRes.ok || containerData.error) {
+      console.error("[Instagram /publish] Container error:", containerData);
+      return res.status(400).json({ error: "Failed to create media container", details: containerData });
+    }
+
+    /* Step 2: Publish the container */
+    const publishRes = await fetch(
+      `https://graph.instagram.com/v19.0/${uid}/media_publish`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          creation_id:  containerData.id,
+          access_token: access_token
+        })
+      }
+    );
+
+    const publishData = await publishRes.json();
+    if (!publishRes.ok || publishData.error) {
+      console.error("[Instagram /publish] Publish error:", publishData);
+      return res.status(400).json({ error: "Failed to publish media", details: publishData });
+    }
+
+    res.json({ media_id: publishData.id, status: "published" });
+
+  } catch (err) {
+    console.error("[Instagram /publish] Exception:", err.message);
+    res.status(500).json({ error: "Publish failed", details: err.message });
+  }
+});
+
+/* ================================================================
+   END INSTAGRAM ROUTES
+================================================================ */
+
+
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`ImpactGrid Dijo running on port ${PORT}`);
