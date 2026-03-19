@@ -26,13 +26,8 @@
 //    YOUTUBE_API_KEY
 // ================================================================
 
-import { createClient } from "@supabase/supabase-js";
-
-// ── Supabase client — service role bypasses RLS ──
-const supabase = createClient(
-  process.env.SUPABASE_URL,
-  process.env.SUPABASE_SERVICE_KEY
-);
+// ── Supabase — reuse existing client from config ──
+import { supabase } from "../config/supabase-client.js";
 
 // ── Config ──
 const GEO        = "GB";
