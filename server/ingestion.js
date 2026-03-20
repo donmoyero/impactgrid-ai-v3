@@ -268,6 +268,10 @@ async function updateHashtagCounts(hashtags, platform) {
 
 // ================================================================
 //  1. TIKTOK INGESTION
+//  Uses video.list (approved scope) — reads connected users' videos.
+//  Runs per stored TikTok access token in Supabase.
+//  Falls back to YouTube keyword matching for trend detection
+//  until more TikTok users connect their accounts.
 // ================================================================
 
 async function ingestTikTok() {
@@ -278,61 +282,54 @@ async function ingestTikTok() {
   let totalVideos = 0;
 
   try {
-    const tokenRes = await fetch("https://open.tiktokapis.com/v2/oauth/token/", {
-      method:  "POST",
-      headers: { "Content-Type": "application/x-www-form-urlencoded" },
-      body: new URLSearchParams({
-        client_key:    process.env.TIKTOK_CLIENT_KEY,
-        client_secret: process.env.TIKTOK_CLIENT_SECRET,
-        grant_type:    "client_credentials"
-      }).toString()
-    });
+    // Get all stored TikTok access tokens from Supabase
+    // (tokens saved when users connect their TikTok accounts)
+    const { data: tokens } = await supabase
+      .from("tiktok_tokens")
+      .select("access_token, open_id, display_name")
+      .gt("expires_at", new Date().toISOString());
 
-    const tokenData   = await tokenRes.json();
-    const accessToken = tokenData.access_token;
-
-    if (!accessToken) {
-      throw new Error("TikTok token failed: " + JSON.stringify(tokenData));
+    if (!tokens || !tokens.length) {
+      log("TikTok", "No connected TikTok accounts yet — skipping video.list fetch");
+      await completeRun(runId, "tiktok", { videos: 0, duration: Date.now() - start });
+      return;
     }
 
-    log("TikTok", "Token acquired — fetching videos");
+    log("TikTok", `Found ${tokens.length} connected accounts — fetching videos`);
 
-    for (const query of TIKTOK_SEED_QUERIES) {
+    for (const token of tokens) {
       try {
-        const searchRes = await fetch(
-          "https://open.tiktokapis.com/v2/video/search/?fields=id,title,video_description,duration,cover_image_url,like_count,comment_count,share_count,view_count,create_time,author.display_name,author.open_id",
+        // video.list — reads the connected user's own videos
+        const res = await fetch(
+          "https://open.tiktokapis.com/v2/video/list/?fields=id,title,video_description,duration,cover_image_url,like_count,comment_count,share_count,view_count,create_time",
           {
             method:  "POST",
             headers: {
-              "Authorization": "Bearer " + accessToken,
+              "Authorization": "Bearer " + token.access_token,
               "Content-Type":  "application/json"
             },
-            body: JSON.stringify({
-              query: {
-                and: [{ operation: "IN", field_name: "keyword", field_values: [query] }]
-              },
-              max_count:  20,
-              start_date: formatDateYYYYMMDD(daysAgo(1)),
-              end_date:   formatDateYYYYMMDD(new Date())
-            })
+            body: JSON.stringify({ max_count: 20 })
           }
         );
 
-        const searchData = await searchRes.json();
-        const videos     = searchData?.data?.videos || [];
+        const data   = await res.json();
+        const videos = data?.data?.videos || [];
 
-        if (!videos.length) continue;
+        if (!videos.length) {
+          log("TikTok", `No videos for ${token.display_name || token.open_id}`);
+          continue;
+        }
 
         const rows = videos.map((v) => ({
           platform:          "tiktok",
           platform_video_id: v.id,
-          creator_id:        v.author?.open_id      || null,
-          creator_name:      v.author?.display_name  || null,
+          creator_id:        token.open_id   || null,
+          creator_name:      token.display_name || null,
           title:             v.title || v.video_description || null,
-          description:       v.video_description    || null,
+          description:       v.video_description || null,
           hashtags:          extractHashtags(v.video_description || ""),
-          duration_secs:     v.duration             || null,
-          thumbnail_url:     v.cover_image_url       || null,
+          duration_secs:     v.duration      || null,
+          thumbnail_url:     v.cover_image_url || null,
           views:             parseInt(v.view_count    || 0),
           likes:             parseInt(v.like_count    || 0),
           comments:          parseInt(v.comment_count || 0),
@@ -344,7 +341,7 @@ async function ingestTikTok() {
         }));
 
         const { error } = await supabase.from("videos").insert(rows);
-        if (error) log("TikTok", `Insert error — ${query}`, error.message);
+        if (error) log("TikTok", `Insert error — ${token.display_name}`, error.message);
         else totalVideos += rows.length;
 
         await updateHashtagCounts(
@@ -352,11 +349,11 @@ async function ingestTikTok() {
           "tiktok"
         );
 
-        log("TikTok", `Stored ${rows.length} videos for: ${query}`);
+        log("TikTok", `Stored ${rows.length} videos for: ${token.display_name || token.open_id}`);
         await sleep(600);
 
-      } catch (queryErr) {
-        log("TikTok", `Error for query "${query}"`, queryErr.message);
+      } catch (tokenErr) {
+        log("TikTok", `Error for account ${token.open_id}`, tokenErr.message);
       }
     }
 
@@ -501,72 +498,105 @@ async function ingestGoogleTrends() {
   const runId = await startRun("google");
   log("Google", "Starting ingestion run");
 
-  try {
-    const res = await fetch(
-      `https://trends.google.com/trends/trendingsearches/daily/rss?geo=${GEO}`,
-      { headers: { "User-Agent": "Mozilla/5.0 (compatible; ImpactGrid/1.0)" } }
-    );
-    const xml = await res.text();
+  let titles   = [];
+  let traffics = [];
 
-    const titleRe   = /<title><!\[CDATA\[([^\]]+)\]\]><\/title>/g;
-    const trafficRe = /<ht:approx_traffic>([^<]+)<\/ht:approx_traffic>/g;
+  const RSS_URLS = [
+    "https://trends.google.com/trends/trendingsearches/daily/rss?geo=GB",
+    "https://trends.google.com/trends/trendingsearches/daily/rss?geo=US",
+    "https://trends.google.com/trends/trendingsearches/daily/rss?geo=GB&hl=en-GB",
+  ];
+  const USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
+    "Mozilla/5.0 (compatible; ImpactGrid/1.0; +https://impactgridgroup.com)",
+  ];
 
-    const titles   = [];
-    const traffics = [];
-    let m;
+  outer: for (const url of RSS_URLS) {
+    for (const ua of USER_AGENTS) {
+      try {
+        const res = await fetch(url, { headers: { "User-Agent": ua } });
+        const xml = await res.text();
+        if (!xml || xml.trim().startsWith("<html") || xml.length < 200) continue;
 
-    while ((m = titleRe.exec(xml)) !== null) {
-      const t = m[1];
-      if (t !== "Google Trends" && t !== "Daily Search Trends") titles.push(t);
+        const cdataRe   = /<title><!\[CDATA\[([^\]]+)\]\]><\/title>/g;
+        const plainRe   = /<title>([^<]{2,80})<\/title>/g;
+        const trafficRe = /<ht:approx_traffic>([^<]+)<\/ht:approx_traffic>/g;
+        let m;
+
+        while ((m = cdataRe.exec(xml)) !== null) {
+          const t = m[1].trim();
+          if (t && !["Google Trends","Daily Search Trends"].includes(t)) titles.push(t);
+        }
+        if (!titles.length) {
+          while ((m = plainRe.exec(xml)) !== null) {
+            const t = m[1].trim();
+            if (t && !["Google Trends","Daily Search Trends","RSS"].includes(t)) titles.push(t);
+          }
+        }
+        while ((m = trafficRe.exec(xml)) !== null) traffics.push(m[1]);
+
+        if (titles.length > 0) { log("Google", `RSS success: ${titles.length} topics from ${url}`); break outer; }
+      } catch (e) { /* try next */ }
+      await sleep(300);
     }
-    while ((m = trafficRe.exec(xml)) !== null) {
-      traffics.push(m[1]);
-    }
-
-    if (!titles.length) {
-      log("Google", "No topics parsed");
-      await completeRun(runId, "google", { trends: 0, duration: Date.now() - start });
-      return;
-    }
-
-    log("Google", `Parsed ${titles.length} topics`);
-
-    const now  = new Date().toISOString();
-    const rows = titles.slice(0, 20).map((topic, i) => {
-      const traffic = parseTraffic(traffics[i] || "0");
-      const score   = googleTrafficToScore(traffic);
-      return {
-        topic,
-        platform_source:      "google",
-        trend_score:          score,
-        velocity_score:       score * 0.9,
-        engagement_score:     50,
-        cross_platform_boost: 0,
-        instagram_prediction: score * 0.4,
-        instagram_reason:     "Based on Google search demand only — cross-platform signals pending",
-        video_count:          0,
-        total_views:          traffic,
-        total_likes:          0,
-        hashtags:             ["#" + topic.replace(/\s+/g, "").toLowerCase()],
-        status:               i < 5 ? "peak" : i < 10 ? "rising" : "emerging",
-        detected_at:          now,
-        window_start:         daysAgo(1).toISOString(),
-        window_end:           now
-      };
-    });
-
-    const { error } = await supabase.from("trends").insert(rows);
-    if (error) log("Google", "Insert error", error.message);
-
-    await completeRun(runId, "google", { trends: rows.length, duration: Date.now() - start });
-    log("Google", `Run complete — ${rows.length} trends stored`);
-
-  } catch (err) {
-    log("Google", "Run FAILED", err.message);
-    await failRun(runId, "google", err.message);
   }
-}
 
+  // Fallback: Google Trends JSON API
+  if (!titles.length) {
+    try {
+      log("Google", "RSS failed — trying JSON API");
+      const res  = await fetch(
+        "https://trends.google.com/trends/api/dailytrends?hl=en-GB&tz=-60&geo=GB&ns=15",
+        { headers: { "User-Agent": USER_AGENTS[0] } }
+      );
+      let text = await res.text();
+      text = text.replace(/^[^\[{]*/, "").trim();
+      const json  = JSON.parse(text);
+      const items = json?.default?.trendingSearchesDays?.[0]?.trendingSearches || [];
+      items.forEach(item => {
+        if (item?.title?.query) { titles.push(item.title.query); traffics.push(item.formattedTraffic || "0"); }
+      });
+      log("Google", `JSON API: ${titles.length} topics`);
+    } catch (e) { log("Google", "JSON API failed", e.message); }
+  }
+
+  if (!titles.length) {
+    log("Google", "All sources failed — no data this run");
+    await completeRun(runId, "google", { trends: 0, duration: Date.now() - start });
+    return;
+  }
+
+  const now  = new Date().toISOString();
+  const rows = titles.slice(0, 20).map((topic, i) => {
+    const traffic = parseTraffic(traffics[i] || "0");
+    const score   = googleTrafficToScore(traffic);
+    return {
+      topic,
+      platform_source:      "google",
+      trend_score:          score,
+      velocity_score:       score * 0.9,
+      engagement_score:     50,
+      cross_platform_boost: 0,
+      instagram_prediction: score * 0.4,
+      instagram_reason:     "Based on Google search demand — cross-platform signals pending",
+      video_count:          0,
+      total_views:          traffic,
+      total_likes:          0,
+      hashtags:             ["#" + topic.replace(/\s+/g, "").toLowerCase()],
+      status:               i < 5 ? "peak" : i < 10 ? "rising" : "emerging",
+      detected_at:          now,
+      window_start:         daysAgo(1).toISOString(),
+      window_end:           now
+    };
+  });
+
+  const { error } = await supabase.from("trends").insert(rows);
+  if (error) log("Google", "Insert error", error.message);
+
+  await completeRun(runId, "google", { trends: rows.length, duration: Date.now() - start });
+  log("Google", `Run complete — ${rows.length} trends stored`);
+}
 
 // ================================================================
 //  4. TOPIC GROUPING
