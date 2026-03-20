@@ -611,6 +611,9 @@ async function ingestGoogleTrends() {
     };
   });
 
+  // Delete old Google trends before inserting fresh ones
+  await supabase.from("trends").delete().eq("platform_source", "google").gte("detected_at", hoursAgo(2).toISOString());
+
   const { error } = await supabase.from("trends").insert(rows);
   if (error) log("Google", "Insert error", error.message);
 
@@ -777,6 +780,15 @@ async function runTrendScoring() {
 
     log("Scoring", `Top topic: "${top50[0].topic}" — score: ${top50[0].trend_score}`);
 
+    // Delete existing trends for same topics before inserting fresh scores
+    // This prevents duplicates building up across ingestion runs
+    const topicList = [...new Set(top50.map(t => t.topic))];
+    await supabase
+      .from("trends")
+      .delete()
+      .in("topic", topicList)
+      .gte("detected_at", hoursAgo(12).toISOString());
+
     const { data: insertedTrends, error: trendError } = await supabase
       .from("trends")
       .insert(top50)
@@ -787,23 +799,26 @@ async function runTrendScoring() {
       return;
     }
 
-    const scoreRows = insertedTrends.map((t) => ({
-      trend_id:             t.id,
-      topic:                t.topic,
-      velocity_score:       t.velocity_score,
-      engagement_score:     t.engagement_score,
-      cross_platform_score: t.cross_platform_boost,
-      recency_score:        50,
-      final_score:          t.trend_score,
-      video_count:          t.video_count,
-      total_views:          t.total_views,
-      views_last_2h:        0,
-      views_last_24h:       t.total_views,
-      scored_at:            now.toISOString()
-    }));
+    // Only keep latest score per trend — clean old score rows
+    if (insertedTrends && insertedTrends.length) {
+      const scoreRows = insertedTrends.map((t) => ({
+        trend_id:             t.id,
+        topic:                t.topic,
+        velocity_score:       t.velocity_score,
+        engagement_score:     t.engagement_score,
+        cross_platform_score: t.cross_platform_boost,
+        recency_score:        50,
+        final_score:          t.trend_score,
+        video_count:          t.video_count,
+        total_views:          t.total_views,
+        views_last_2h:        0,
+        views_last_24h:       t.total_views,
+        scored_at:            now.toISOString()
+      }));
 
-    const { error: scoreError } = await supabase.from("trend_scores").insert(scoreRows);
-    if (scoreError) log("Scoring", "Score rows error", scoreError.message);
+      const { error: scoreError } = await supabase.from("trend_scores").insert(scoreRows);
+      if (scoreError) log("Scoring", "Score rows error", scoreError.message);
+    }
 
     log("Scoring", `Complete — ${top50.length} trends written to Supabase`);
 
