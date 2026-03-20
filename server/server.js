@@ -252,6 +252,38 @@ app.post("/tiktok/refresh", async (req, res) => {
 });
 
 
+/* ── Save TikTok token to Supabase (called from tiktok-callback.html) ── */
+app.post("/tiktok/save-token", async (req, res) => {
+  const { open_id, access_token, refresh_token, expires_in, scope, display_name, avatar_url } = req.body;
+  if (!open_id || !access_token) return res.status(400).json({ error: "Missing open_id or access_token" });
+  try {
+    const { createClient } = await import("@supabase/supabase-js");
+    const sb = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
+    const expiresAt = new Date(Date.now() + (expires_in || 86400) * 1000).toISOString();
+    const { error } = await sb.from("tiktok_tokens").upsert({
+      open_id,
+      access_token,
+      refresh_token: refresh_token || "",
+      expires_at:    expiresAt,
+      scope:         scope || "",
+      display_name:  display_name || "",
+      avatar_url:    avatar_url || "",
+      updated_at:    new Date().toISOString()
+    }, { onConflict: "open_id" });
+    if (error) {
+      console.error("[TikTok save-token] Supabase error:", error.message);
+      return res.status(500).json({ error: "Failed to save token", details: error.message });
+    }
+    console.log("[TikTok save-token] Saved token for:", display_name || open_id);
+    res.json({ saved: true, open_id });
+  } catch (err) {
+    console.error("[TikTok save-token] Exception:", err.message);
+    res.status(500).json({ error: "Token save failed", details: err.message });
+  }
+});
+
+
+
 /* ================================================================
    INSTAGRAM ROUTES
    Render env: INSTAGRAM_APP_ID, INSTAGRAM_APP_SECRET, INSTAGRAM_REDIRECT_URI
