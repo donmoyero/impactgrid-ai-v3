@@ -551,6 +551,323 @@ app.get("/trends/google", async (req, res) => {
 });
 
 
+
+/* ================================================================
+   PHASE 3 — AI RECOMMENDATION LAYER
+   Dijo reads real scored trends from Supabase and generates
+   specific creator recommendations using Groq + Llama.
+
+   Endpoints:
+     POST /ai/recommendations   — full recommendation pack for a creator
+     POST /ai/content-brief     — detailed brief for one specific trend
+     POST /ai/trend-analysis    — Dijo analyses all current trends
+     GET  /ai/daily-briefing    — daily creator briefing (cached 1hr)
+================================================================ */
+
+import { createClient as createSupabaseClient } from "@supabase/supabase-js";
+
+const _aiSupabase = createSupabaseClient(
+  process.env.SUPABASE_URL,
+  process.env.SUPABASE_SERVICE_KEY
+);
+
+/* ── Helper: fetch top trends from Supabase ── */
+async function getTopTrends(limit = 10) {
+  const { data } = await _aiSupabase
+    .from("v_top_trends")
+    .select("*")
+    .limit(limit);
+  return data || [];
+}
+
+/* ── Helper: call Groq with creator system prompt ── */
+async function dijoAI(userPrompt, systemOverride = null) {
+  const system = systemOverride || `You are Dijo, ImpactGrid's Creator Intelligence Engine.
+You analyse real trend data and give creators specific, actionable advice.
+You speak directly and confidently. No waffle, no generic advice.
+Always reference the actual data provided. Be specific about platforms, formats, and timing.
+Format responses clearly. Use short paragraphs. Keep it punchy.`;
+
+  const completion = await groq.chat.completions.create({
+    model:       "llama-3.3-70b-versatile",
+    max_tokens:  1200,
+    temperature: 0.75,
+    messages: [
+      { role: "system", content: system },
+      { role: "user",   content: userPrompt }
+    ]
+  });
+  return completion.choices[0]?.message?.content || "";
+}
+
+/* ── Daily briefing cache ── */
+let _dailyBriefingCache = { data: null, cachedAt: 0 };
+
+/* ================================================================
+   ENDPOINT 1: POST /ai/recommendations
+   Full recommendation pack based on real trend data + creator context
+   Body: { niche?, platform?, goal?, connected_platforms? }
+================================================================ */
+app.post("/ai/recommendations", async (req, res) => {
+  try {
+    const { niche = "", platform = "All", goal = "grow", connected_platforms = [] } = req.body;
+
+    // Fetch real trend data
+    const trends = await getTopTrends(10);
+    if (!trends.length) {
+      return res.json({ recommendations: [], message: "No trend data yet — check back in 30 minutes." });
+    }
+
+    // Build trend context string
+    const trendContext = trends.map((t, i) =>
+      `${i+1}. "${t.topic}" — Score: ${t.trend_score}/100 | Platform: ${t.platform_source} | Status: ${t.status} | Views: ${Number(t.total_views).toLocaleString()} | IG Prediction: ${t.instagram_prediction}%`
+    ).join("\n");
+
+    const nicheCtx    = niche ? `Creator niche: ${niche}` : "General creator";
+    const platformCtx = platform !== "All" ? `Primary platform: ${platform}` : "Multi-platform creator";
+    const connectedCtx = connected_platforms.length
+      ? `Connected platforms: ${connected_platforms.join(", ")}`
+      : "";
+
+    const prompt = `Here is today's real trend intelligence data from ImpactGrid:
+
+${trendContext}
+
+Creator context:
+- ${nicheCtx}
+- ${platformCtx}
+- Goal: ${goal}
+${connectedCtx}
+
+Based on this REAL data, give me:
+
+1. TOP 3 CONTENT OPPORTUNITIES — for each one:
+   - Topic name
+   - Why it's a good opportunity RIGHT NOW (use the actual scores)
+   - Best platform for this creator
+   - Exact content format (e.g. "60-second explainer", "talking head reaction")
+   - Best posting time (day + time)
+   - One specific hook idea
+
+2. ONE TREND TO AVOID — and why
+
+3. THIS WEEK'S STRATEGY — 2-3 sentences on what to focus on
+
+Be specific. Reference the actual scores and data. No generic advice.`;
+
+    const reply = await dijoAI(prompt);
+
+    // Parse the response into structured recommendations
+    res.json({
+      recommendations: parseRecommendations(reply, trends),
+      raw:             reply,
+      trends_analysed: trends.length,
+      top_trend:       trends[0]?.topic || "",
+      ts:              new Date().toISOString()
+    });
+
+  } catch (err) {
+    console.error("[AI /recommendations] Error:", err.message);
+    res.status(500).json({ error: "AI recommendation failed", details: err.message });
+  }
+});
+
+/* ================================================================
+   ENDPOINT 2: POST /ai/content-brief
+   Deep dive brief for one specific trend topic
+   Body: { topic, platform?, style?, niche? }
+================================================================ */
+app.post("/ai/content-brief", async (req, res) => {
+  try {
+    const { topic, platform = "TikTok", style = "Educational", niche = "" } = req.body;
+    if (!topic) return res.status(400).json({ error: "Missing topic" });
+
+    // Get trend data for this specific topic
+    const { data: trendData } = await _aiSupabase
+      .from("trends")
+      .select("*")
+      .ilike("topic", `%${topic}%`)
+      .order("trend_score", { ascending: false })
+      .limit(1);
+
+    const trend = trendData?.[0];
+    const trendCtx = trend
+      ? `Trend Score: ${trend.trend_score}/100 | Status: ${trend.status} | Views: ${Number(trend.total_views).toLocaleString()} | Hashtags: ${(trend.hashtags||[]).join(", ")} | IG Prediction: ${trend.instagram_prediction}%`
+      : "Live trending topic";
+
+    const prompt = `Create a complete content brief for a creator making a video about: "${topic}"
+
+Real trend data: ${trendCtx}
+Platform: ${platform}
+Style: ${style}
+${niche ? `Niche: ${niche}` : ""}
+
+Provide:
+
+HOOK (2 versions):
+- Version A (curiosity): 
+- Version B (bold claim):
+
+SCRIPT OUTLINE:
+- 0-3s: Hook
+- 3-15s: Setup/context
+- 15-45s: Core value (3 key points)
+- 45-55s: Proof/example
+- 55-60s: CTA
+
+CAPTION (ready to copy, with emojis):
+
+HASHTAGS (10, mix of niche + trending):
+
+BEST POSTING TIME: Day + time for ${platform}
+
+THUMBNAIL/COVER IDEA:
+
+TREND WINDOW: How long this topic will stay relevant`;
+
+    const reply = await dijoAI(prompt);
+
+    res.json({
+      topic,
+      platform,
+      style,
+      brief:      reply,
+      trend_score: trend?.trend_score || null,
+      trend_status: trend?.status || "trending",
+      hashtags:   trend?.hashtags || [],
+      ts:         new Date().toISOString()
+    });
+
+  } catch (err) {
+    console.error("[AI /content-brief] Error:", err.message);
+    res.status(500).json({ error: "Content brief failed", details: err.message });
+  }
+});
+
+/* ================================================================
+   ENDPOINT 3: POST /ai/trend-analysis
+   Dijo analyses all current trends and gives strategic overview
+================================================================ */
+app.post("/ai/trend-analysis", async (req, res) => {
+  try {
+    const trends = await getTopTrends(15);
+    if (!trends.length) return res.json({ analysis: "No trend data available yet." });
+
+    const trendContext = trends.map((t, i) =>
+      `${i+1}. "${t.topic}" | Score: ${t.trend_score} | ${t.platform_source} | ${t.status} | ${Number(t.total_views).toLocaleString()} views | IG: ${t.instagram_prediction}%`
+    ).join("\n");
+
+    // Cross-platform topics
+    const crossPlatform = trends.filter(t => t.platform_source === "cross");
+    const peakTopics    = trends.filter(t => t.status === "peak");
+    const risingTopics  = trends.filter(t => t.status === "rising");
+    const igOpps        = trends.filter(t => t.instagram_prediction >= 50);
+
+    const prompt = `Analyse these real ImpactGrid trend scores from ${new Date().toLocaleDateString("en-GB", {weekday:"long",day:"numeric",month:"long"})}:
+
+${trendContext}
+
+Summary stats:
+- Peak topics: ${peakTopics.map(t=>t.topic).join(", ") || "none"}
+- Rising topics: ${risingTopics.map(t=>t.topic).join(", ") || "none"}  
+- Cross-platform hits: ${crossPlatform.map(t=>t.topic).join(", ") || "none"}
+- Strong IG predictions: ${igOpps.map(t=>t.topic).join(", ") || "none"}
+
+Give creators:
+1. THE STORY TODAY (2-3 sentences on what the overall trend landscape looks like)
+2. BIGGEST OPPORTUNITY RIGHT NOW (1 topic, why, what to make)
+3. RISING BEFORE IT PEAKS (1 early-stage topic to jump on)
+4. INSTAGRAM PLAY (best topic for IG right now based on predictions)
+5. WHAT TO IGNORE (1-2 topics that look trending but won't convert)
+
+Keep it sharp. Creators are busy — give them signal, not noise.`;
+
+    const reply = await dijoAI(prompt);
+    res.json({ analysis: reply, trends_count: trends.length, ts: new Date().toISOString() });
+
+  } catch (err) {
+    console.error("[AI /trend-analysis] Error:", err.message);
+    res.status(500).json({ error: "Trend analysis failed", details: err.message });
+  }
+});
+
+/* ================================================================
+   ENDPOINT 4: GET /ai/daily-briefing
+   Cached daily briefing — regenerates every hour
+================================================================ */
+app.get("/ai/daily-briefing", async (req, res) => {
+  try {
+    const now     = Date.now();
+    const ONE_HR  = 60 * 60 * 1000;
+
+    // Return cached if fresh
+    if (_dailyBriefingCache.data && (now - _dailyBriefingCache.cachedAt) < ONE_HR) {
+      return res.json({ ..._dailyBriefingCache.data, cached: true });
+    }
+
+    const trends = await getTopTrends(10);
+    if (!trends.length) return res.json({ briefing: "No trend data yet.", cached: false });
+
+    const top3 = trends.slice(0, 3);
+    const trendContext = top3.map((t, i) =>
+      `${i+1}. "${t.topic}" — ${t.trend_score}/100 — ${t.status} — ${t.platform_source}`
+    ).join("\n");
+
+    const today  = new Date().toLocaleDateString("en-GB", { weekday: "long", day: "numeric", month: "long", year: "numeric" });
+    const prompt = `You are Dijo. Give creators their daily intelligence briefing for ${today}.
+
+Top 3 trends right now:
+${trendContext}
+
+Write a sharp 4-5 sentence daily briefing that:
+1. Opens with what's hot today (reference actual topics)
+2. Gives one specific action to take today
+3. Mentions the best platform play right now
+4. Ends with a motivating but realistic note
+
+Sound like a smart adviser talking to a creator over morning coffee. Be specific, not generic.`;
+
+    const briefing = await dijoAI(prompt);
+
+    const result = {
+      briefing,
+      top_trends:  top3.map(t => ({ topic: t.topic, score: t.trend_score, status: t.status })),
+      date:        today,
+      cached:      false,
+      ts:          new Date().toISOString()
+    };
+
+    _dailyBriefingCache = { data: result, cachedAt: now };
+    res.json(result);
+
+  } catch (err) {
+    console.error("[AI /daily-briefing] Error:", err.message);
+    res.status(500).json({ error: "Daily briefing failed", details: err.message });
+  }
+});
+
+/* ── Helper: parse AI recommendations into structured objects ── */
+function parseRecommendations(text, trends) {
+  const recs = [];
+  // Extract numbered opportunities
+  const matches = text.match(/(?:^|\n)\s*\d+\.\s+(?:CONTENT OPPORTUNITY|TOP|OPPORTUNITY)?[:\s]*([^\n]{5,80})/gm) || [];
+  matches.slice(0, 3).forEach((m, i) => {
+    const topic = m.replace(/^\s*\d+\.\s+(?:CONTENT OPPORTUNITY|TOP|OPPORTUNITY)?[:\s]*/i, "").trim();
+    const matchedTrend = trends.find(t => topic.toLowerCase().includes(t.topic.toLowerCase()));
+    recs.push({
+      rank:        i + 1,
+      topic:       topic.slice(0, 80),
+      score:       matchedTrend?.trend_score || null,
+      platform:    matchedTrend?.platform_source || "multi",
+      ig_prediction: matchedTrend?.instagram_prediction || 0
+    });
+  });
+  return recs.length ? recs : trends.slice(0, 3).map((t, i) => ({
+    rank: i + 1, topic: t.topic, score: t.trend_score,
+    platform: t.platform_source, ig_prediction: t.instagram_prediction
+  }));
+}
+
 /* ================================================================
    START SERVER
 ================================================================ */
