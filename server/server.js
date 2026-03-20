@@ -163,14 +163,23 @@ app.post("/tiktok/profile", async (req, res) => {
   const { access_token } = req.body;
   if (!access_token) return res.status(400).json({ error: "Missing access_token" });
   try {
+    // TikTok v2 user/info — only request fields covered by approved scopes
+    // user.info.basic: open_id, avatar_url, display_name
+    // user.info.profile: profile_web_link, bio_description, is_verified
+    // user.info.stats: follower_count, following_count, likes_count, video_count
+    const fields = "open_id,avatar_url,display_name,bio_description,is_verified,follower_count,following_count,likes_count,video_count";
     const response = await fetch(
-      "https://open.tiktokapis.com/v2/user/info/?fields=open_id,union_id,avatar_url,display_name,username,follower_count,following_count,likes_count,video_count",
+      `https://open.tiktokapis.com/v2/user/info/?fields=${fields}`,
       { method: "GET", headers: { "Authorization": "Bearer " + access_token } }
     );
     const data = await response.json();
-    if (!response.ok || data.error) return res.status(400).json({ error: "Failed to fetch profile", details: data });
+    console.log("[TikTok /profile] Response:", JSON.stringify(data).slice(0, 300));
+    if (data?.error?.code && data.error.code !== "ok") {
+      return res.status(400).json({ error: "TikTok profile error", details: data });
+    }
     res.json(data);
   } catch (err) {
+    console.error("[TikTok /profile] Exception:", err.message);
     res.status(500).json({ error: "Profile fetch failed", details: err.message });
   }
 });
@@ -179,8 +188,11 @@ app.post("/tiktok/videos", async (req, res) => {
   const { access_token, max_count } = req.body;
   if (!access_token) return res.status(400).json({ error: "Missing access_token" });
   try {
+    // video.list scope — fields available: id, title, cover_image_url, video_description,
+    // duration, like_count, comment_count, share_count, view_count, create_time
+    const fields = "id,title,cover_image_url,video_description,duration,like_count,comment_count,share_count,view_count,create_time";
     const response = await fetch(
-      "https://open.tiktokapis.com/v2/video/list/?fields=id,title,cover_image_url,video_description,duration,like_count,comment_count,share_count,view_count",
+      `https://open.tiktokapis.com/v2/video/list/?fields=${fields}`,
       {
         method:  "POST",
         headers: { "Authorization": "Bearer " + access_token, "Content-Type": "application/json" },
@@ -188,9 +200,13 @@ app.post("/tiktok/videos", async (req, res) => {
       }
     );
     const data = await response.json();
-    if (!response.ok || data.error) return res.status(400).json({ error: "Failed to fetch videos", details: data });
+    console.log("[TikTok /videos] Status:", response.status, "Response:", JSON.stringify(data).slice(0, 300));
+    if (data?.error?.code && data.error.code !== "ok") {
+      return res.status(400).json({ error: "TikTok videos error", details: data });
+    }
     res.json(data);
   } catch (err) {
+    console.error("[TikTok /videos] Exception:", err.message);
     res.status(500).json({ error: "Videos fetch failed", details: err.message });
   }
 });
